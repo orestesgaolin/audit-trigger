@@ -60,8 +60,7 @@ CREATE TABLE audit.logged_actions (
     client_query text,
     action TEXT NOT NULL CHECK (action IN ('I','D','U', 'T')),
     row_data jsonb,
-    changed_fields jsonb,
-    statement_only boolean not null
+    changed_fields jsonb
 );
 
 REVOKE ALL ON audit.logged_actions FROM public;
@@ -84,7 +83,6 @@ COMMENT ON COLUMN audit.logged_actions.application_name IS 'Application name set
 COMMENT ON COLUMN audit.logged_actions.action IS 'Action type; I = insert, D = delete, U = update, T = truncate';
 COMMENT ON COLUMN audit.logged_actions.row_data IS 'Record value. Null for statement-level trigger. For INSERT this is the new tuple. For DELETE and UPDATE it is the old tuple.';
 COMMENT ON COLUMN audit.logged_actions.changed_fields IS 'New values of fields changed by UPDATE. Null except for row-level UPDATE events.';
-COMMENT ON COLUMN audit.logged_actions.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
 
 -- Drop indexes if exist
 DROP INDEX IF EXISTS logged_actions_relid_idx;
@@ -104,6 +102,8 @@ DECLARE
     excluded_cols text[] = ARRAY[]::text[];
     new_r jsonb;
     old_r jsonb;
+    audit_table_name text;
+    insert_query text;
 BEGIN
     IF TG_WHEN <> 'AFTER' THEN
         RAISE EXCEPTION 'audit.if_modified_func() may only run as an AFTER trigger';
@@ -125,8 +125,8 @@ BEGIN
         inet_client_port(),                           -- client_port
         current_query(),                              -- top-level query or queries (if multistatement) from client
         substring(TG_OP,1,1),                         -- action
-        NULL, NULL,                                   -- row_data, changed_fields
-        'f'                                           -- statement_only
+        NULL, NULL                                   -- row_data, changed_fields
+        
         );
 
     IF NOT TG_ARGV[0]::boolean IS DISTINCT FROM 'f'::boolean THEN
@@ -134,7 +134,13 @@ BEGIN
     END IF;
 
     IF TG_ARGV[1] IS NOT NULL THEN
-        excluded_cols = TG_ARGV[1]::text[];
+        audit_table_name = TG_ARGV[1];
+    ELSE
+        RAISE EXCEPTION 'audit table name is required';
+    END IF;
+
+    IF TG_ARGV[2] IS NOT NULL THEN
+        excluded_cols = TG_ARGV[2]::text[];
     END IF;
 
     IF (TG_OP = 'UPDATE' AND TG_LEVEL = 'ROW') THEN
@@ -147,56 +153,29 @@ BEGIN
           audit_row.changed_fields
         FROM jsonb_each(old_r) as old_t
         JOIN jsonb_each(new_r) as new_t
-          ON (old_t.key = new_t.key AND old_t.value <> new_t.value);
+          ON (old_t.key = new_t.key AND old_t.value IS DISTINCT FROM new_t.value);
+
+        IF audit_row.changed_fields = '{}'::jsonb OR audit_row.changed_fields IS NULL THEN
+            RETURN NULL;
+        END IF;
     ELSIF (TG_OP = 'DELETE' AND TG_LEVEL = 'ROW') THEN
         audit_row.row_data = to_jsonb(OLD) - excluded_cols;
     ELSIF (TG_OP = 'INSERT' AND TG_LEVEL = 'ROW') THEN
         audit_row.row_data = to_jsonb(NEW) - excluded_cols;
-    ELSIF (TG_LEVEL = 'STATEMENT' AND TG_OP IN ('INSERT','UPDATE','DELETE','TRUNCATE')) THEN
-        audit_row.statement_only = 't';
     ELSE
         RAISE EXCEPTION '[audit.if_modified_func] - Trigger func added as trigger for unhandled case: %, %',TG_OP, TG_LEVEL;
         RETURN NULL;
     END IF;
-    INSERT INTO audit.logged_actions VALUES (audit_row.*);
+
+    insert_query := 'INSERT INTO ' || audit_table_name || ' VALUES ($1.*)';
+    EXECUTE insert_query USING audit_row;
+
     RETURN NULL;
 END;
 $body$
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public;
-
--- Drop comment if exists (overwrite)
-COMMENT ON FUNCTION audit.if_modified_func() IS $body$
-Track changes to a table at the statement and/or row level.
-
-Optional parameters to trigger in CREATE TRIGGER call:
-
-param 0: boolean, whether to log the query text. Default 't'.
-
-param 1: text[], columns to ignore in updates. Default [].
-
-         Updates to ignored cols are omitted from changed_fields.
-
-         Updates with only ignored cols changed are not inserted
-         into the audit log.
-
-         Almost all the processing work is still done for updates
-         that ignored. If you need to save the load, you need to use
-         WHEN clause on the trigger instead.
-
-         No warning or error is issued if ignored_cols contains columns
-         that do not exist in the target table. This lets you specify
-         a standard set of ignored columns.
-
-There is no parameter to disable logging of values. Add this trigger as
-a 'FOR EACH STATEMENT' rather than 'FOR EACH ROW' trigger if you do not
-want to log row values.
-
-Note that the user name logged is the login role for the session. The audit trigger
-cannot obtain the active role because it is reset by the SECURITY DEFINER invocation
-of the audit trigger its self.
-$body$;
 
 -- Drop function if exists
 DROP FUNCTION IF EXISTS audit.audit_table(regclass, boolean, boolean, boolean, text[]) CASCADE;
@@ -207,9 +186,18 @@ DECLARE
   row_targets text = '';
   _q_txt text;
   _ignored_cols_snip text = '';
+  target_table_name text;
+  audit_table_name text;
+  audit_table_name_quoted text;
 BEGIN
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_row ON ' || target_table;
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_stm ON ' || target_table;
+
+    SELECT relname INTO target_table_name FROM pg_class WHERE oid = target_table;
+    audit_table_name := 'audit.' || target_table_name;
+    audit_table_name_quoted := quote_ident('audit') || '.' || quote_ident(target_table_name);
+
+    EXECUTE 'CREATE TABLE IF NOT EXISTS ' || audit_table_name_quoted || ' (LIKE audit.logged_actions INCLUDING ALL)';
 
     IF audit_rows THEN
         -- Determine which events to audit at row level
@@ -225,19 +213,21 @@ BEGIN
         _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER ' || row_targets || ' ON ' ||
                  target_table ||
                  ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
-                 quote_literal(audit_query_text) || _ignored_cols_snip || ');';
+                 quote_literal(audit_query_text) || ', ' || quote_literal(audit_table_name) || _ignored_cols_snip || ');';
         RAISE NOTICE '%',_q_txt;
         EXECUTE _q_txt;
         stm_targets = 'TRUNCATE';
     ELSE
     END IF;
 
-    _q_txt = 'CREATE TRIGGER audit_trigger_stm AFTER ' || stm_targets || ' ON ' ||
-             target_table ||
-             ' FOR EACH STATEMENT EXECUTE PROCEDURE audit.if_modified_func('||
-             quote_literal(audit_query_text) || ');';
-    RAISE NOTICE '%',_q_txt;
-    EXECUTE _q_txt;
+    IF audit_query_text THEN
+        _q_txt = 'CREATE TRIGGER audit_trigger_stm AFTER ' || stm_targets || ' ON ' ||
+                 target_table ||
+                 ' FOR EACH STATEMENT EXECUTE PROCEDURE audit.if_modified_func('||
+                 quote_literal(audit_query_text) || ', ' || quote_literal(audit_table_name) || ');';
+        RAISE NOTICE '%',_q_txt;
+        EXECUTE _q_txt;
+    END IF;
 
 END;
 $body$
