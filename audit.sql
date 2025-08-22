@@ -17,12 +17,12 @@
 --> -- but has been completely rewritten.
 --> --
 
-CREATE SCHEMA audit;
+CREATE SCHEMA IF NOT EXISTS audit;
 REVOKE ALL ON SCHEMA audit FROM public;
 
-COMMENT ON SCHEMA audit IS 'Out-of-table audit/history logging tables and trigger functions';
+-- Drop table if exists
+DROP TABLE IF EXISTS audit.logged_actions CASCADE;
 
---
 -- Audited data. Lots of information is available, it's just a matter of how much
 -- you really want to record. See:
 --
@@ -66,6 +66,7 @@ CREATE TABLE audit.logged_actions (
 
 REVOKE ALL ON audit.logged_actions FROM public;
 
+-- Drop comments if exist (Postgres doesn't support DROP COMMENT, so just overwrite)
 COMMENT ON TABLE audit.logged_actions IS 'History of auditable actions on audited tables, from audit.if_modified_func()';
 COMMENT ON COLUMN audit.logged_actions.event_id IS 'Unique identifier for each auditable event';
 COMMENT ON COLUMN audit.logged_actions.schema_name IS 'Database schema audited table for this event is in';
@@ -85,9 +86,17 @@ COMMENT ON COLUMN audit.logged_actions.row_data IS 'Record value. Null for state
 COMMENT ON COLUMN audit.logged_actions.changed_fields IS 'New values of fields changed by UPDATE. Null except for row-level UPDATE events.';
 COMMENT ON COLUMN audit.logged_actions.statement_only IS '''t'' if audit event is from an FOR EACH STATEMENT trigger, ''f'' for FOR EACH ROW';
 
+-- Drop indexes if exist
+DROP INDEX IF EXISTS logged_actions_relid_idx;
+DROP INDEX IF EXISTS logged_actions_action_tstamp_tx_stm_idx;
+DROP INDEX IF EXISTS logged_actions_action_idx;
+
 CREATE INDEX logged_actions_relid_idx ON audit.logged_actions(relid);
 CREATE INDEX logged_actions_action_tstamp_tx_stm_idx ON audit.logged_actions(action_tstamp_stm);
 CREATE INDEX logged_actions_action_idx ON audit.logged_actions(action);
+
+-- Drop functions if exist
+DROP FUNCTION IF EXISTS audit.if_modified_func() CASCADE;
 
 CREATE OR REPLACE FUNCTION audit.if_modified_func() RETURNS TRIGGER AS $body$
 DECLARE
@@ -157,7 +166,7 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, public;
 
-
+-- Drop comment if exists (overwrite)
 COMMENT ON FUNCTION audit.if_modified_func() IS $body$
 Track changes to a table at the statement and/or row level.
 
@@ -189,7 +198,8 @@ cannot obtain the active role because it is reset by the SECURITY DEFINER invoca
 of the audit trigger its self.
 $body$;
 
-
+-- Drop function if exists
+DROP FUNCTION IF EXISTS audit.audit_table(regclass, boolean, boolean, boolean, text[]) CASCADE;
 
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean, audit_inserts boolean, ignored_cols text[]) RETURNS void AS $body$
 DECLARE
@@ -233,27 +243,31 @@ END;
 $body$
 language 'plpgsql';
 
-COMMENT ON FUNCTION audit.audit_table(regclass, boolean, boolean, text[]) IS $body$
+-- Drop comment if exists (overwrite)
+COMMENT ON FUNCTION audit.audit_table(regclass, boolean, boolean, boolean, text[]) IS $body$
 Add auditing support to a table.
 
 Arguments:
    target_table:     Table name, schema qualified if not on search_path
    audit_rows:       Record each row change, or only audit at a statement level
    audit_query_text: Record the text of the client query that triggered the audit event?
+   audit_inserts:    Also audit inserts at the row level?
    ignored_cols:     Columns to exclude from update diffs, ignore updates that change only ignored cols.
 $body$;
 
--- Pg doesn't allow variadic calls with 0 params, so provide a wrapper
+-- Drop wrapper functions if exist
+DROP FUNCTION IF EXISTS audit.audit_table(regclass, boolean, boolean) CASCADE;
+DROP FUNCTION IF EXISTS audit.audit_table(regclass) CASCADE;
+
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean) RETURNS void AS $body$
-SELECT audit.audit_table($1, $2, $3, ARRAY[]::text[]);
+SELECT audit.audit_table($1, $2, $3, TRUE, ARRAY[]::text[]);
 $body$ LANGUAGE SQL;
 
 -- And provide a convenience call wrapper for the simplest case
 -- of row-level logging with no excluded cols and query logging enabled.
---
 CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass) RETURNS void AS $body$
-SELECT audit.audit_table($1, BOOLEAN 't', BOOLEAN 't');
-$body$ LANGUAGE 'sql';
+SELECT audit.audit_table($1, TRUE, TRUE, TRUE, ARRAY[]::text[]);
+$body$ LANGUAGE SQL;
 
 COMMENT ON FUNCTION audit.audit_table(regclass) IS $body$
 Add auditing support to the given table. Row-level changes will be logged with full client query text. No cols are ignored.
