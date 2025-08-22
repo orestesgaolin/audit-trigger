@@ -37,12 +37,13 @@ select * from audit.logged_actions
 
 The function `audit.audit_table` takes the following arguments:
 
-| argument | description |
-| --- | --- |
-| `target_table`    | Table name, schema qualified if not on search_path |
-| `audit_rows`      | Record each row change, or only audit at a statement level |
-| `audit_query_text` | Record the text of the client query that triggered the audit event? |
-| `ignored_cols`  | Columns to exclude from update diffs, ignore updates that change only ignored cols. |
+| argument           | description                                                                                 |
+| ------------------ | ------------------------------------------------------------------------------------------- |
+| `target_table`     | Table name, schema qualified if not on search_path                                          |
+| `audit_rows`       | Record each row change, or only audit at a statement level                                  |
+| `audit_query_text` | Record the text of the client query that triggered the audit event?                         |
+| `audit_inserts`    | If true, audit INSERTs at row level. If false, only UPDATE/DELETE are audited at row level. |
+| `ignored_cols`     | Columns to exclude from update diffs, ignore updates that change only ignored cols.         |
 
 ### Examples
 
@@ -62,4 +63,10 @@ Log changes for every row, log the sql statement, but don't log the data of the 
 
 ```sql
 select audit.audit_table('author', true, true, '{email,phone_number}');
+```
+
+Log only updates and deletes (not inserts) at row level. Don't log the sql statement. Ignore changes to the `created_at` column.
+
+```sql
+select audit.audit_table('author', true, false, false, '{created_at}');
 ```

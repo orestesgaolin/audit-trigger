@@ -191,9 +191,10 @@ $body$;
 
 
 
-CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean, ignored_cols text[]) RETURNS void AS $body$
+CREATE OR REPLACE FUNCTION audit.audit_table(target_table regclass, audit_rows boolean, audit_query_text boolean, audit_inserts boolean, ignored_cols text[]) RETURNS void AS $body$
 DECLARE
   stm_targets text = 'INSERT OR UPDATE OR DELETE OR TRUNCATE';
+  row_targets text = '';
   _q_txt text;
   _ignored_cols_snip text = '';
 BEGIN
@@ -201,10 +202,17 @@ BEGIN
     EXECUTE 'DROP TRIGGER IF EXISTS audit_trigger_stm ON ' || target_table;
 
     IF audit_rows THEN
+        -- Determine which events to audit at row level
+        IF audit_inserts THEN
+            row_targets := 'INSERT OR UPDATE OR DELETE';
+        ELSE
+            row_targets := 'UPDATE OR DELETE';
+        END IF;
+
         IF array_length(ignored_cols,1) > 0 THEN
             _ignored_cols_snip = ', ' || quote_literal(ignored_cols);
         END IF;
-        _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER INSERT OR UPDATE OR DELETE ON ' ||
+        _q_txt = 'CREATE TRIGGER audit_trigger_row AFTER ' || row_targets || ' ON ' ||
                  target_table ||
                  ' FOR EACH ROW EXECUTE PROCEDURE audit.if_modified_func(' ||
                  quote_literal(audit_query_text) || _ignored_cols_snip || ');';
